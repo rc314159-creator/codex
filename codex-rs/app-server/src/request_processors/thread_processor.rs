@@ -3077,7 +3077,8 @@ impl ThreadRequestProcessor {
 
     async fn live_active_turn_snapshot(&self, thread_id: ThreadId) -> Option<Turn> {
         let thread_state = self.thread_state_manager.thread_state(thread_id).await;
-        thread_state.lock().await.active_turn_snapshot()
+        let state = thread_state.lock().await;
+        state.active_turn_snapshot()
     }
 
     async fn thread_turns_list_response_inner(
