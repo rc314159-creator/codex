@@ -3049,7 +3049,7 @@ impl ThreadRequestProcessor {
                     .paginated_thread_full_turns(thread_id)
                     .await
                     .map_err(ThreadReadViewError::JsonRpc)?;
-                self.merge_active_turn_into_thread_read(thread_id, &mut thread)
+                self.merge_active_turn_into_thread_read(thread_id, thread)
                     .await;
                 return Ok(());
             }
