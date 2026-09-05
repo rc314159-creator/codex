@@ -39,7 +39,7 @@ mod thread_list_cwd_filter_tests {
 mod background_terminal_pagination_tests {
     use super::super::paginate_background_terminals;
     use codex_app_server_protocol::ThreadBackgroundTerminal;
-    use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::LegacyAppPathString;
     use pretty_assertions::assert_eq;
 
     fn terminal(process_id: &str) -> ThreadBackgroundTerminal {
@@ -49,7 +49,7 @@ mod background_terminal_pagination_tests {
             item_id: format!("item-{process_id}"),
             process_id: process_id.to_string(),
             command: format!("command-{process_id}"),
-            cwd: AbsolutePathBuf::from_absolute_path(cwd).expect("absolute cwd"),
+            cwd: LegacyAppPathString::from_string(cwd),
             os_pid: None,
             cpu_percent: None,
             rss_kb: None,
@@ -124,15 +124,8 @@ mod thread_processor_behavior_tests {
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
-    use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
-    use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
-    use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::openai_models::ReasoningEffort;
-    use codex_protocol::permissions::FileSystemAccessMode;
-    use codex_protocol::permissions::FileSystemPath;
-    use codex_protocol::permissions::FileSystemSandboxEntry;
-    use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
@@ -142,45 +135,67 @@ mod thread_processor_behavior_tests {
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
+    use serde_json::Value;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    fn dynamic_tool(
+        namespace: Option<&str>,
+        name: impl Into<String>,
+        input_schema: Value,
+        defer_loading: bool,
+    ) -> DynamicToolSpec {
+        let function = DynamicToolFunctionSpec {
+            name: name.into(),
+            description: "test".to_string(),
+            input_schema,
+            defer_loading,
+        };
+        match namespace {
+            Some(namespace) => {
+                DynamicToolSpec::Namespace(codex_app_server_protocol::DynamicToolNamespaceSpec {
+                    name: namespace.to_string(),
+                    description: "test namespace".to_string(),
+                    tools: vec![DynamicToolNamespaceTool::Function(function)],
+                })
+            }
+            None => DynamicToolSpec::Function(function),
+        }
+    }
+
     #[test]
     fn validate_dynamic_tools_rejects_unsupported_input_schema() {
-        let tools = vec![ApiDynamicToolSpec {
-            namespace: None,
-            name: "my_tool".to_string(),
-            description: "test".to_string(),
-            input_schema: json!({"type": "null"}),
-            defer_loading: false,
-        }];
+        let tools = vec![dynamic_tool(
+            /*namespace*/ None,
+            "my_tool",
+            json!({"type": "null"}),
+            /*defer_loading*/ false,
+        )];
         let err = validate_dynamic_tools(&tools).expect_err("invalid schema");
         assert!(err.contains("my_tool"), "unexpected error: {err}");
     }
 
     #[test]
     fn validate_dynamic_tools_accepts_sanitizable_input_schema() {
-        let tools = vec![ApiDynamicToolSpec {
-            namespace: None,
-            name: "my_tool".to_string(),
-            description: "test".to_string(),
+        let tools = vec![dynamic_tool(
+            /*namespace*/ None,
+            "my_tool",
             // Missing `type` is common; core sanitizes these to a supported schema.
-            input_schema: json!({"properties": {}}),
-            defer_loading: false,
-        }];
+            json!({"properties": {}}),
+            /*defer_loading*/ false,
+        )];
         validate_dynamic_tools(&tools).expect("valid schema");
     }
 
     #[test]
     fn validate_dynamic_tools_accepts_nullable_field_schema() {
-        let tools = vec![ApiDynamicToolSpec {
-            namespace: None,
-            name: "my_tool".to_string(),
-            description: "test".to_string(),
-            input_schema: json!({
+        let tools = vec![dynamic_tool(
+            /*namespace*/ None,
+            "my_tool",
+            json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": ["string", "null"]}
@@ -188,45 +203,57 @@ mod thread_processor_behavior_tests {
                 "required": ["query"],
                 "additionalProperties": false
             }),
-            defer_loading: false,
-        }];
+            /*defer_loading*/ false,
+        )];
         validate_dynamic_tools(&tools).expect("valid schema");
     }
 
     #[test]
     fn validate_dynamic_tools_accepts_same_name_in_different_namespaces() {
         let tools = vec![
-            ApiDynamicToolSpec {
-                namespace: Some("codex_app".to_string()),
-                name: "my_tool".to_string(),
-                description: "test".to_string(),
-                input_schema: json!({
+            dynamic_tool(
+                Some("codex_app"),
+                "my_tool",
+                json!({
                     "type": "object",
                     "properties": {},
                     "additionalProperties": false
                 }),
-                defer_loading: true,
-            },
-            ApiDynamicToolSpec {
-                namespace: Some("other_app".to_string()),
-                name: "my_tool".to_string(),
-                description: "test".to_string(),
-                input_schema: json!({
+                /*defer_loading*/ true,
+            ),
+            dynamic_tool(
+                Some("other_app"),
+                "my_tool",
+                json!({
                     "type": "object",
                     "properties": {},
                     "additionalProperties": false
                 }),
-                defer_loading: true,
-            },
+                /*defer_loading*/ true,
+            ),
         ];
         validate_dynamic_tools(&tools).expect("valid schema");
     }
 
     #[test]
     fn validate_dynamic_tools_accepts_responses_compatible_identifiers() {
-        let tools = vec![ApiDynamicToolSpec {
-            namespace: Some("Codex-App_2".to_string()),
-            name: "lookup-ticket_2".to_string(),
+        let tools = vec![dynamic_tool(
+            Some("Codex-App_2"),
+            "lookup-ticket_2",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            /*defer_loading*/ true,
+        )];
+        validate_dynamic_tools(&tools).expect("valid schema");
+    }
+
+    #[test]
+    fn validate_dynamic_tools_rejects_duplicate_name_in_same_namespace() {
+        let function = || DynamicToolFunctionSpec {
+            name: "my_tool".to_string(),
             description: "test".to_string(),
             input_schema: json!({
                 "type": "object",
@@ -234,36 +261,17 @@ mod thread_processor_behavior_tests {
                 "additionalProperties": false
             }),
             defer_loading: true,
-        }];
-        validate_dynamic_tools(&tools).expect("valid schema");
-    }
-
-    #[test]
-    fn validate_dynamic_tools_rejects_duplicate_name_in_same_namespace() {
-        let tools = vec![
-            ApiDynamicToolSpec {
-                namespace: Some("codex_app".to_string()),
-                name: "my_tool".to_string(),
-                description: "test".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                }),
-                defer_loading: true,
+        };
+        let tools = vec![DynamicToolSpec::Namespace(
+            codex_app_server_protocol::DynamicToolNamespaceSpec {
+                name: "codex_app".to_string(),
+                description: "test namespace".to_string(),
+                tools: vec![
+                    DynamicToolNamespaceTool::Function(function()),
+                    DynamicToolNamespaceTool::Function(function()),
+                ],
             },
-            ApiDynamicToolSpec {
-                namespace: Some("codex_app".to_string()),
-                name: "my_tool".to_string(),
-                description: "test".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                }),
-                defer_loading: true,
-            },
-        ];
+        )];
         let err = validate_dynamic_tools(&tools).expect_err("duplicate name");
         assert!(err.contains("codex_app"), "unexpected error: {err}");
         assert!(err.contains("my_tool"), "unexpected error: {err}");
@@ -310,54 +318,87 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
+    fn thread_read_merges_in_progress_active_turn_into_persisted_history() {
+        let persisted_items = vec![RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                client_id: None,
+                message: "persisted".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+                ..Default::default()
+            },
+        ))];
+        let active_turn = Turn {
+            id: "live-turn".to_string(),
+            items: vec![ThreadItem::UserMessage {
+                id: "live-user-message".to_string(),
+                client_id: None,
+                content: vec![V2UserInput::Text {
+                    text: "live".to_string(),
+                    text_elements: Vec::new(),
+                }],
+            }],
+            items_view: TurnItemsView::Full,
+            error: None,
+            status: TurnStatus::InProgress,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+        };
+
+        let turns = reconstruct_thread_turns_for_thread_read(
+            &persisted_items,
+            Some(active_turn.clone()),
+        );
+
+        assert_eq!(turns.last(), Some(&active_turn));
+    }
+
+    #[test]
     fn validate_dynamic_tools_rejects_empty_namespace() {
-        let tools = vec![ApiDynamicToolSpec {
-            namespace: Some("".to_string()),
-            name: "my_tool".to_string(),
-            description: "test".to_string(),
-            input_schema: json!({
+        let tools = vec![dynamic_tool(
+            Some(""),
+            "my_tool",
+            json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
             }),
-            defer_loading: false,
-        }];
+            /*defer_loading*/ false,
+        )];
         let err = validate_dynamic_tools(&tools).expect_err("empty namespace");
-        assert!(err.contains("my_tool"), "unexpected error: {err}");
         assert!(err.contains("namespace"), "unexpected error: {err}");
     }
 
     #[test]
     fn validate_dynamic_tools_rejects_reserved_namespace() {
-        let tools = vec![ApiDynamicToolSpec {
-            namespace: Some("mcp__server__".to_string()),
-            name: "my_tool".to_string(),
-            description: "test".to_string(),
-            input_schema: json!({
+        let tools = vec![dynamic_tool(
+            Some("mcp__server__"),
+            "my_tool",
+            json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
             }),
-            defer_loading: false,
-        }];
+            /*defer_loading*/ false,
+        )];
         let err = validate_dynamic_tools(&tools).expect_err("reserved namespace");
-        assert!(err.contains("my_tool"), "unexpected error: {err}");
         assert!(err.contains("reserved"), "unexpected error: {err}");
     }
 
     #[test]
     fn validate_dynamic_tools_rejects_name_not_supported_by_responses() {
-        let tools = vec![ApiDynamicToolSpec {
-            namespace: None,
-            name: "lookup.ticket".to_string(),
-            description: "test".to_string(),
-            input_schema: json!({
+        let tools = vec![dynamic_tool(
+            /*namespace*/ None,
+            "lookup.ticket",
+            json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
             }),
-            defer_loading: false,
-        }];
+            /*defer_loading*/ false,
+        )];
         let err = validate_dynamic_tools(&tools).expect_err("invalid name");
         assert!(err.contains("lookup.ticket"), "unexpected error: {err}");
         assert!(
@@ -368,17 +409,16 @@ mod thread_processor_behavior_tests {
 
     #[test]
     fn validate_dynamic_tools_rejects_namespace_not_supported_by_responses() {
-        let tools = vec![ApiDynamicToolSpec {
-            namespace: Some("codex.app".to_string()),
-            name: "lookup_ticket".to_string(),
-            description: "test".to_string(),
-            input_schema: json!({
+        let tools = vec![dynamic_tool(
+            Some("codex.app"),
+            "lookup_ticket",
+            json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
             }),
-            defer_loading: true,
-        }];
+            /*defer_loading*/ true,
+        )];
         let err = validate_dynamic_tools(&tools).expect_err("invalid namespace");
         assert!(err.contains("codex.app"), "unexpected error: {err}");
         assert!(
@@ -390,54 +430,59 @@ mod thread_processor_behavior_tests {
     #[test]
     fn validate_dynamic_tools_rejects_name_longer_than_responses_limit() {
         let long_name = "a".repeat(129);
-        let tools = vec![ApiDynamicToolSpec {
-            namespace: None,
-            name: long_name.clone(),
-            description: "test".to_string(),
-            input_schema: json!({
+        let tools = vec![dynamic_tool(
+            /*namespace*/ None,
+            long_name.clone(),
+            json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
             }),
-            defer_loading: false,
-        }];
+            /*defer_loading*/ false,
+        )];
         let err = validate_dynamic_tools(&tools).expect_err("name too long");
         assert!(err.contains("at most 128"), "unexpected error: {err}");
         assert!(err.contains(&long_name), "unexpected error: {err}");
     }
 
     #[test]
-    fn validate_dynamic_tools_rejects_namespace_longer_than_responses_limit() {
+    fn validate_dynamic_tools_rejects_namespace_fields_over_limits() {
         let long_namespace = "a".repeat(65);
-        let tools = vec![ApiDynamicToolSpec {
-            namespace: Some(long_namespace.clone()),
-            name: "lookup_ticket".to_string(),
-            description: "test".to_string(),
-            input_schema: json!({
+        let mut tools = vec![dynamic_tool(
+            Some(&long_namespace),
+            "lookup_ticket",
+            json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
             }),
-            defer_loading: true,
-        }];
+            /*defer_loading*/ true,
+        )];
         let err = validate_dynamic_tools(&tools).expect_err("namespace too long");
         assert!(err.contains("at most 64"), "unexpected error: {err}");
         assert!(err.contains(&long_namespace), "unexpected error: {err}");
+
+        let DynamicToolSpec::Namespace(namespace) = &mut tools[0] else {
+            unreachable!("expected namespace")
+        };
+        namespace.name = "tickets".to_string();
+        namespace.description = "a".repeat(1025);
+        let err = validate_dynamic_tools(&tools).expect_err("namespace description too long");
+        assert!(err.contains("at most 1024"), "unexpected error: {err}");
     }
 
     #[test]
     fn validate_dynamic_tools_rejects_reserved_responses_namespace() {
-        let tools = vec![ApiDynamicToolSpec {
-            namespace: Some("functions".to_string()),
-            name: "lookup_ticket".to_string(),
-            description: "test".to_string(),
-            input_schema: json!({
+        let tools = vec![dynamic_tool(
+            Some("functions"),
+            "lookup_ticket",
+            json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
             }),
-            defer_loading: true,
-        }];
+            /*defer_loading*/ true,
+        )];
         let err = validate_dynamic_tools(&tools).expect_err("reserved Responses namespace");
         assert!(err.contains("functions"), "unexpected error: {err}");
         assert!(err.contains("Responses API"), "unexpected error: {err}");
@@ -452,6 +497,7 @@ mod thread_processor_behavior_tests {
         let thread_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread");
         let stored_thread = StoredThread {
+            originator: None,
             thread_id,
             extra_config: None,
             rollout_path: Some(PathBuf::from("/tmp/thread.jsonl")),
@@ -464,10 +510,17 @@ mod thread_processor_behavior_tests {
             reasoning_effort: None,
             created_at: created_at.with_timezone(&Utc),
             updated_at: updated_at.with_timezone(&Utc),
+            recency_at: updated_at.with_timezone(&Utc),
             archived_at: None,
+            section: None,
+            section_position: None,
+            section_entered_at: None,
+            project_id: None,
+            daybreak_enabled: None,
             cwd: PathBuf::from("/tmp"),
             cli_version: "0.0.0".to_string(),
             source: SessionSource::Cli,
+            history_mode: Default::default(),
             thread_source: Some(codex_protocol::protocol::ThreadSource::User),
             agent_nickname: None,
             agent_role: None,
@@ -490,82 +543,6 @@ mod thread_processor_behavior_tests {
             summary.updated_at.as_deref(),
             Some("2025-01-02T03:04:06.789Z")
         );
-    }
-
-    #[test]
-    fn requested_permissions_trust_project_uses_permission_profile_intent() {
-        let cwd = test_path_buf("/tmp/project").abs();
-        let full_access_profile = codex_protocol::models::PermissionProfile::Disabled;
-        let workspace_write_profile = codex_protocol::models::PermissionProfile::workspace_write();
-        let read_only_profile = codex_protocol::models::PermissionProfile::read_only();
-        let split_write_profile =
-            codex_protocol::models::PermissionProfile::from_runtime_permissions(
-                &FileSystemSandboxPolicy::restricted(vec![
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::Path { path: cwd.clone() },
-                        access: FileSystemAccessMode::Write,
-                    },
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::GlobPattern {
-                            pattern: "/tmp/project/**/*.env".to_string(),
-                        },
-                        access: FileSystemAccessMode::Deny,
-                    },
-                ]),
-                NetworkSandboxPolicy::Restricted,
-            );
-
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(full_access_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(workspace_write_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(split_write_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string()),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                default_permissions: Some(
-                    BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string()
-                ),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(!requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(read_only_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(!requested_permissions_trust_project(
-            &ConfigOverrides {
-                default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
     }
 
     #[test]
@@ -670,6 +647,7 @@ mod thread_processor_behavior_tests {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: true,
+            supports_standalone_web_search: false,
         };
         let config_manager = ConfigManager::new(
             temp_dir.path().to_path_buf(),
@@ -745,6 +723,7 @@ mod thread_processor_behavior_tests {
             approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
             approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
             permission_profile: codex_protocol::models::PermissionProfile::Disabled,
+            full_access: false,
             active_permission_profile: None,
             environments: TurnEnvironmentSelections::new(cwd, Vec::new()),
             workspace_roots: Vec::new(),
@@ -762,9 +741,11 @@ mod thread_processor_behavior_tests {
                 },
             },
             session_source: SessionSource::Cli,
+            history_mode: Default::default(),
             forked_from_thread_id: None,
             parent_thread_id: None,
             thread_source: None,
+            originator: "test_originator".to_string(),
         };
 
         assert_eq!(
@@ -975,9 +956,9 @@ mod thread_processor_behavior_tests {
 
     #[tokio::test]
     async fn read_summary_from_rollout_returns_empty_preview_when_no_user_message() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
         use codex_protocol::protocol::SessionMetaLine;
+        use codex_rollout::RolloutItem;
+        use codex_rollout::RolloutLine;
         use std::fs;
         use std::fs::FileTimes;
 
@@ -988,6 +969,7 @@ mod thread_processor_behavior_tests {
         let timestamp = "2025-09-05T16:53:11.850Z".to_string();
 
         let session_meta = SessionMeta {
+            session_id: conversation_id.into(),
             id: conversation_id,
             timestamp: timestamp.clone(),
             model_provider: None,
@@ -996,6 +978,7 @@ mod thread_processor_behavior_tests {
 
         let line = RolloutLine {
             timestamp: timestamp.clone(),
+            ordinal: None,
             item: RolloutItem::SessionMeta(SessionMetaLine {
                 meta: session_meta.clone(),
                 git: None,
@@ -1031,9 +1014,9 @@ mod thread_processor_behavior_tests {
 
     #[tokio::test]
     async fn read_summary_from_rollout_preserves_agent_nickname() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
         use codex_protocol::protocol::SessionMetaLine;
+        use codex_rollout::RolloutItem;
+        use codex_rollout::RolloutLine;
         use std::fs;
 
         let temp_dir = TempDir::new()?;
@@ -1044,6 +1027,7 @@ mod thread_processor_behavior_tests {
         let timestamp = "2025-09-05T16:53:11.850Z".to_string();
 
         let session_meta = SessionMeta {
+            session_id: parent_thread_id.into(),
             id: conversation_id,
             timestamp: timestamp.clone(),
             source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -1062,6 +1046,7 @@ mod thread_processor_behavior_tests {
 
         let line = RolloutLine {
             timestamp,
+            ordinal: None,
             item: RolloutItem::SessionMeta(SessionMetaLine {
                 meta: session_meta,
                 git: None,
@@ -1081,9 +1066,9 @@ mod thread_processor_behavior_tests {
 
     #[tokio::test]
     async fn read_summary_from_rollout_preserves_forked_from_id() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
         use codex_protocol::protocol::SessionMetaLine;
+        use codex_rollout::RolloutItem;
+        use codex_rollout::RolloutLine;
         use std::fs;
 
         let temp_dir = TempDir::new()?;
@@ -1094,6 +1079,7 @@ mod thread_processor_behavior_tests {
         let timestamp = "2025-09-05T16:53:11.850Z".to_string();
 
         let session_meta = SessionMeta {
+            session_id: conversation_id.into(),
             id: conversation_id,
             forked_from_id: Some(forked_from_id),
             timestamp: timestamp.clone(),
@@ -1103,6 +1089,7 @@ mod thread_processor_behavior_tests {
 
         let line = RolloutLine {
             timestamp,
+            ordinal: None,
             item: RolloutItem::SessionMeta(SessionMetaLine {
                 meta: session_meta,
                 git: None,
@@ -1140,6 +1127,8 @@ mod thread_processor_behavior_tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     questions: vec![],
+                    is_blocking: true,
+                    auto_resolution_ms: None,
                 },
             ))
             .await;
@@ -1362,6 +1351,31 @@ mod thread_processor_behavior_tests {
             .expect("timed out waiting for subscriber update")
             .expect("has-connections watcher should remain open");
         assert!(*has_connections.borrow());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_thread_subscriber_unblocks_after_connection_attaches() -> Result<()> {
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::from_string("ba62fd70-2ec2-4b1b-9d94-355694332dd2")?;
+        let connection = ConnectionId(1);
+        manager
+            .connection_initialized(connection, ConnectionCapabilities::default())
+            .await;
+
+        let wait_for_subscriber = manager.wait_for_thread_subscriber(thread_id);
+        let attach_connection = async {
+            tokio::task::yield_now().await;
+            manager
+                .try_add_connection_to_thread(thread_id, connection)
+                .await
+        };
+        let ((), attached) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(wait_for_subscriber, attach_connection)
+        })
+        .await?;
+
+        assert!(attached);
         Ok(())
     }
 
